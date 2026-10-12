@@ -214,10 +214,10 @@ fn bench_prefill_paths() -> Result<()> {
     Ok(())
 }
 
-/// AMD WMMA matrix cores against `__dp4a`, on the same weights, for the two
-/// dtypes WMMA is wired up for ([`super::mmq_wmma::unit`]). Skips silently on
-/// anything without WMMA (RDNA2 and older), the same way the other
-/// benchmarks skip without a ROCm device at all.
+/// AMD WMMA matrix cores against `__dp4a`, on the same weights, for every
+/// dtype WMMA is wired up for ([`super::mmq_wmma::WMMA_DTYPES`]). Skips
+/// silently on anything without WMMA (RDNA2 and older), the same way the
+/// other benchmarks skip without a ROCm device at all.
 #[test]
 #[ignore = "benchmark: needs a GPU and takes seconds"]
 fn bench_wmma_vs_dp4a() -> Result<()> {
@@ -240,8 +240,9 @@ fn bench_wmma_vs_dp4a() -> Result<()> {
         (4096, 4096),
         (4096, 32000),
     ];
-    for dtype in [GgmlDType::Q4K, GgmlDType::Q6K] {
-        let unit = super::mmq_wmma::unit(dtype).expect("WMMA unit for Q4K/Q6K");
+    for entry in super::mmq_wmma::WMMA_DTYPES {
+        let dtype = entry.dtype;
+        let unit = entry.unit;
         for (k, n) in shapes {
             let rhs = Tensor::rand(-1f32, 1f32, (n, k), &device)?;
             let qt = QTensor::quantize(&rhs, dtype)?;

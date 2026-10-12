@@ -165,8 +165,32 @@ pub(crate) const MMQ_GGUF_HEADERS: &[(&str, &str)] = &[
 /// every [`MmqGgufUnit`].
 pub(crate) const MMQ_GGUF_QUANTIZE_SRC: &str = mmq_gguf_source!("mmq_quantize.cu");
 
+/// `mmq_instance_q4_0.cu`'s source.
+pub(crate) const MMQ_GGUF_Q4_0_SRC: &str = mmq_gguf_source!("mmq_instance_q4_0.cu");
+
+/// `mmq_instance_q4_1.cu`'s source.
+pub(crate) const MMQ_GGUF_Q4_1_SRC: &str = mmq_gguf_source!("mmq_instance_q4_1.cu");
+
+/// `mmq_instance_q5_0.cu`'s source.
+pub(crate) const MMQ_GGUF_Q5_0_SRC: &str = mmq_gguf_source!("mmq_instance_q5_0.cu");
+
+/// `mmq_instance_q5_1.cu`'s source.
+pub(crate) const MMQ_GGUF_Q5_1_SRC: &str = mmq_gguf_source!("mmq_instance_q5_1.cu");
+
+/// `mmq_instance_q8_0.cu`'s source.
+pub(crate) const MMQ_GGUF_Q8_0_SRC: &str = mmq_gguf_source!("mmq_instance_q8_0.cu");
+
+/// `mmq_instance_q2_k.cu`'s source.
+pub(crate) const MMQ_GGUF_Q2_K_SRC: &str = mmq_gguf_source!("mmq_instance_q2_k.cu");
+
+/// `mmq_instance_q3_k.cu`'s source.
+pub(crate) const MMQ_GGUF_Q3_K_SRC: &str = mmq_gguf_source!("mmq_instance_q3_k.cu");
+
 /// `mmq_instance_q4_k.cu`'s source.
 pub(crate) const MMQ_GGUF_Q4_K_SRC: &str = mmq_gguf_source!("mmq_instance_q4_k.cu");
+
+/// `mmq_instance_q5_k.cu`'s source.
+pub(crate) const MMQ_GGUF_Q5_K_SRC: &str = mmq_gguf_source!("mmq_instance_q5_k.cu");
 
 /// `mmq_instance_q6_k.cu`'s source.
 pub(crate) const MMQ_GGUF_Q6_K_SRC: &str = mmq_gguf_source!("mmq_instance_q6_k.cu");

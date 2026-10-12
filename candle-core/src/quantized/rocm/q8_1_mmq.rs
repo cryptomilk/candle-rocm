@@ -44,16 +44,13 @@ type QuantizeFn = unsafe extern "C" fn(
     stream: *mut c_void,
 );
 
-/// The `launch_mmq_quantize_q8_1_*` symbol `dtype`'s `mmq_gguf` kernel reads,
-/// matching `mmq_get_q8_1_ds_layout` in `mmq_gguf.cuh`: Q4_K reads `DS4`
-/// (a `half2` scale and sum per 32 values), Q6_K reads `D4` (a float scale
-/// per 32 values, no sum).
+/// The `launch_mmq_quantize_q8_1_*` symbol `dtype`'s `mmq_gguf` kernel reads;
+/// see [`super::mmq_wmma::WMMA_DTYPES`] for the layout each dtype uses and why.
 fn symbol(dtype: GgmlDType) -> Option<&'static [u8]> {
-    match dtype {
-        GgmlDType::Q4K => Some(b"launch_mmq_quantize_q8_1_DS4\0"),
-        GgmlDType::Q6K => Some(b"launch_mmq_quantize_q8_1_D4\0"),
-        _ => None,
-    }
+    super::mmq_wmma::WMMA_DTYPES
+        .iter()
+        .find(|d| d.dtype == dtype)
+        .map(|d| d.quantize_symbol)
 }
 
 /// Quantize `rows` rows of `k` f32 columns, read from `src` starting at

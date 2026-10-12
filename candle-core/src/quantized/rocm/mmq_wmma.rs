@@ -1,5 +1,5 @@
-//! The AMD WMMA MMQ dispatch for [`super::QRocmStorage::fwd`], Q4_K and
-//! Q6_K only.
+//! The AMD WMMA MMQ dispatch for [`super::QRocmStorage::fwd`], covering every
+//! GGML quant type that has an `mmq_instance_*.cu`.
 //!
 //! Mirrors [`super::mmq`]'s shape (requantize the activations, then a tiled
 //! integer matmul against the packed weights) but against the `mmq_gguf`
@@ -25,23 +25,105 @@ use crate::{DType, Layout, Result};
 use candle_rocm_kernels::MmqGgufUnit;
 use std::ffi::c_void;
 
+/// One GGML quant type WMMA is wired up for: its `mmq_gguf` unit, the
+/// `launch_mmq_gguf_*` matmul symbol, and the `launch_mmq_quantize_q8_1_*`
+/// symbol its activations need (matching `mmq_get_q8_1_ds_layout` in
+/// `mmq_gguf.cuh`: `DS4` is a `half2` scale and sum per 32 values, `D4` is a
+/// float scale per 32 values with no sum, and `D2S6` (Q2_K only) is a float
+/// scale per 64 values plus a 6-bit sum per 16 values).
+///
+/// The single source of truth for which dtypes WMMA covers: [`unit`],
+/// [`symbol`], [`super::q8_1_mmq::symbol`], the benchmark in
+/// [`super::bench::bench_wmma_vs_dp4a`], and the hardware tests in
+/// `tests_mmq_wmma.rs` all derive from this table, so wiring up a new dtype
+/// only needs one new row here (plus its `MmqGgufUnit` variant and source
+/// constant in `candle-rocm-kernels`).
+pub(super) struct WmmaDtype {
+    pub(super) dtype: GgmlDType,
+    pub(super) unit: MmqGgufUnit,
+    pub(super) gguf_symbol: &'static [u8],
+    pub(super) quantize_symbol: &'static [u8],
+}
+
+pub(super) const WMMA_DTYPES: &[WmmaDtype] = &[
+    WmmaDtype {
+        dtype: GgmlDType::Q4_0,
+        unit: MmqGgufUnit::Q4_0,
+        gguf_symbol: b"launch_mmq_gguf_q4_0\0",
+        quantize_symbol: b"launch_mmq_quantize_q8_1_DS4\0",
+    },
+    WmmaDtype {
+        dtype: GgmlDType::Q4_1,
+        unit: MmqGgufUnit::Q4_1,
+        gguf_symbol: b"launch_mmq_gguf_q4_1\0",
+        quantize_symbol: b"launch_mmq_quantize_q8_1_DS4\0",
+    },
+    WmmaDtype {
+        dtype: GgmlDType::Q5_0,
+        unit: MmqGgufUnit::Q5_0,
+        gguf_symbol: b"launch_mmq_gguf_q5_0\0",
+        quantize_symbol: b"launch_mmq_quantize_q8_1_D4\0",
+    },
+    WmmaDtype {
+        dtype: GgmlDType::Q5_1,
+        unit: MmqGgufUnit::Q5_1,
+        gguf_symbol: b"launch_mmq_gguf_q5_1\0",
+        quantize_symbol: b"launch_mmq_quantize_q8_1_DS4\0",
+    },
+    WmmaDtype {
+        dtype: GgmlDType::Q8_0,
+        unit: MmqGgufUnit::Q8_0,
+        gguf_symbol: b"launch_mmq_gguf_q8_0\0",
+        quantize_symbol: b"launch_mmq_quantize_q8_1_D4\0",
+    },
+    WmmaDtype {
+        dtype: GgmlDType::Q2K,
+        unit: MmqGgufUnit::Q2K,
+        gguf_symbol: b"launch_mmq_gguf_q2_k\0",
+        quantize_symbol: b"launch_mmq_quantize_q8_1_D2S6\0",
+    },
+    WmmaDtype {
+        dtype: GgmlDType::Q3K,
+        unit: MmqGgufUnit::Q3K,
+        gguf_symbol: b"launch_mmq_gguf_q3_k\0",
+        quantize_symbol: b"launch_mmq_quantize_q8_1_D4\0",
+    },
+    WmmaDtype {
+        dtype: GgmlDType::Q4K,
+        unit: MmqGgufUnit::Q4K,
+        gguf_symbol: b"launch_mmq_gguf_q4_k\0",
+        quantize_symbol: b"launch_mmq_quantize_q8_1_DS4\0",
+    },
+    WmmaDtype {
+        dtype: GgmlDType::Q5K,
+        unit: MmqGgufUnit::Q5K,
+        gguf_symbol: b"launch_mmq_gguf_q5_k\0",
+        quantize_symbol: b"launch_mmq_quantize_q8_1_DS4\0",
+    },
+    WmmaDtype {
+        dtype: GgmlDType::Q6K,
+        unit: MmqGgufUnit::Q6K,
+        gguf_symbol: b"launch_mmq_gguf_q6_k\0",
+        quantize_symbol: b"launch_mmq_quantize_q8_1_D4\0",
+    },
+];
+
 /// The `mmq_gguf` unit for `dtype`, or `None` if WMMA has not been wired up
 /// for it yet.
 pub(super) fn unit(dtype: GgmlDType) -> Option<MmqGgufUnit> {
-    match dtype {
-        GgmlDType::Q4K => Some(MmqGgufUnit::Q4K),
-        GgmlDType::Q6K => Some(MmqGgufUnit::Q6K),
-        _ => None,
-    }
+    WMMA_DTYPES
+        .iter()
+        .find(|d| d.dtype == dtype)
+        .map(|d| d.unit)
 }
 
 /// The `launch_mmq_gguf_*` symbol for `unit`.
 fn symbol(unit: MmqGgufUnit) -> &'static [u8] {
-    match unit {
-        MmqGgufUnit::Q4K => b"launch_mmq_gguf_q4_k\0",
-        MmqGgufUnit::Q6K => b"launch_mmq_gguf_q6_k\0",
-        MmqGgufUnit::Quantize => unreachable!("Quantize is q8_1_mmq's unit, not a matmul one"),
-    }
+    WMMA_DTYPES
+        .iter()
+        .find(|d| d.unit == unit)
+        .map(|d| d.gguf_symbol)
+        .unwrap_or_else(|| unreachable!("Quantize is q8_1_mmq's unit, not a matmul one"))
 }
 
 type LaunchFn = unsafe extern "C" fn(

@@ -25,27 +25,54 @@ pub enum MmqGgufUnit {
     /// `mmq_quantize.cu`. `f32 -> block_q8_1_mmq` activation requantization,
     /// shared by every quant type below.
     Quantize,
+    /// `mmq_instance_q4_0.cu`.
+    Q4_0,
+    /// `mmq_instance_q4_1.cu`.
+    Q4_1,
+    /// `mmq_instance_q5_0.cu`.
+    Q5_0,
+    /// `mmq_instance_q5_1.cu`.
+    Q5_1,
+    /// `mmq_instance_q8_0.cu`.
+    Q8_0,
+    /// `mmq_instance_q2_k.cu`.
+    Q2K,
+    /// `mmq_instance_q3_k.cu`.
+    Q3K,
     /// `mmq_instance_q4_k.cu`.
     Q4K,
+    /// `mmq_instance_q5_k.cu`.
+    Q5K,
     /// `mmq_instance_q6_k.cu`.
     Q6K,
 }
 
 impl MmqGgufUnit {
-    fn source(self) -> &'static str {
+    /// `(source, name)` for this unit, the only place the two are tied
+    /// together: adding a unit means adding one arm here plus its source
+    /// constant in `lib.rs`, instead of keeping two matches in sync.
+    fn source_and_name(self) -> (&'static str, &'static str) {
         match self {
-            MmqGgufUnit::Quantize => crate::MMQ_GGUF_QUANTIZE_SRC,
-            MmqGgufUnit::Q4K => crate::MMQ_GGUF_Q4_K_SRC,
-            MmqGgufUnit::Q6K => crate::MMQ_GGUF_Q6_K_SRC,
+            MmqGgufUnit::Quantize => (crate::MMQ_GGUF_QUANTIZE_SRC, "mmq_gguf_quantize"),
+            MmqGgufUnit::Q4_0 => (crate::MMQ_GGUF_Q4_0_SRC, "mmq_gguf_q4_0"),
+            MmqGgufUnit::Q4_1 => (crate::MMQ_GGUF_Q4_1_SRC, "mmq_gguf_q4_1"),
+            MmqGgufUnit::Q5_0 => (crate::MMQ_GGUF_Q5_0_SRC, "mmq_gguf_q5_0"),
+            MmqGgufUnit::Q5_1 => (crate::MMQ_GGUF_Q5_1_SRC, "mmq_gguf_q5_1"),
+            MmqGgufUnit::Q8_0 => (crate::MMQ_GGUF_Q8_0_SRC, "mmq_gguf_q8_0"),
+            MmqGgufUnit::Q2K => (crate::MMQ_GGUF_Q2_K_SRC, "mmq_gguf_q2_k"),
+            MmqGgufUnit::Q3K => (crate::MMQ_GGUF_Q3_K_SRC, "mmq_gguf_q3_k"),
+            MmqGgufUnit::Q4K => (crate::MMQ_GGUF_Q4_K_SRC, "mmq_gguf_q4_k"),
+            MmqGgufUnit::Q5K => (crate::MMQ_GGUF_Q5_K_SRC, "mmq_gguf_q5_k"),
+            MmqGgufUnit::Q6K => (crate::MMQ_GGUF_Q6_K_SRC, "mmq_gguf_q6_k"),
         }
     }
 
+    fn source(self) -> &'static str {
+        self.source_and_name().0
+    }
+
     pub(crate) fn name(self) -> &'static str {
-        match self {
-            MmqGgufUnit::Quantize => "mmq_gguf_quantize",
-            MmqGgufUnit::Q4K => "mmq_gguf_q4_k",
-            MmqGgufUnit::Q6K => "mmq_gguf_q6_k",
-        }
+        self.source_and_name().1
     }
 }
 

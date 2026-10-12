@@ -1,4 +1,4 @@
-//! Hardware correctness tests for the AMD WMMA MMQ path, Q4_K and Q6_K only.
+//! Hardware correctness tests for the AMD WMMA MMQ path, all wired-up dtypes.
 //!
 //! Mirrors `tests_mmq.rs`'s shape: WMMA requantizes the activations to
 //! `block_q8_1_mmq`, a numerically *different* computation from the dense
@@ -25,8 +25,10 @@ macro_rules! rocm_wmma_device {
     };
 }
 
-/// Both dtypes WMMA is wired up for so far; see `mmq_wmma::unit`.
-const WMMA_DTYPES: [GgmlDType; 2] = [GgmlDType::Q4K, GgmlDType::Q6K];
+/// Every dtype WMMA is wired up for; see `mmq_wmma::WMMA_DTYPES`.
+fn wmma_dtypes() -> impl Iterator<Item = GgmlDType> {
+    mmq_wmma::WMMA_DTYPES.iter().map(|d| d.dtype)
+}
 
 /// Same tolerance `tests_mmq.rs` holds the dp4a path to, for the same reason:
 /// the `q8_1`-family activations carry seven bits of mantissa and the
@@ -81,11 +83,11 @@ fn check(device: &Device, dtype: GgmlDType, m: usize, k: usize, n: usize) -> Res
     Ok(())
 }
 
-/// The prefill shape, for both wired-up dtypes.
+/// The prefill shape, for every wired-up dtype.
 #[test]
 fn wmma_matches_a_dequantized_matmul() -> Result<()> {
     let device = rocm_wmma_device!();
-    for dtype in WMMA_DTYPES {
+    for dtype in wmma_dtypes() {
         for (m, n) in [(9usize, 64usize), (64, 256)] {
             check(&device, dtype, m, 256, n)?;
         }
@@ -100,7 +102,7 @@ fn wmma_matches_a_dequantized_matmul() -> Result<()> {
 #[test]
 fn wmma_handles_partial_tiles() -> Result<()> {
     let device = rocm_wmma_device!();
-    for dtype in WMMA_DTYPES {
+    for dtype in wmma_dtypes() {
         for m in [1usize, 9, 65, 130] {
             for n in [1usize, 3, 65, 129] {
                 check(&device, dtype, m, 256, n)?;
@@ -115,7 +117,7 @@ fn wmma_handles_partial_tiles() -> Result<()> {
 #[test]
 fn wmma_handles_a_long_shared_dimension() -> Result<()> {
     let device = rocm_wmma_device!();
-    for dtype in WMMA_DTYPES {
+    for dtype in wmma_dtypes() {
         for k in [1024usize, 2048, 4096] {
             check(&device, dtype, 32, k, 64)?;
         }
