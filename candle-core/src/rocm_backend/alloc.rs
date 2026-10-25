@@ -46,16 +46,24 @@
 //! reserves one virtual address range and bump-allocates within it instead,
 //! so a repeated allocation sequence against a pool reset to the same
 //! watermark always lands at the same addresses.
+//!
+//! [`GraphCaptureSession`] is the switch between the two: while one is
+//! alive, [`SendSyncDeviceMemory::new`] routes through the supplied
+//! `VmmPool` instead of the bucketed free list, with no change at any of
+//! its call sites. Freeing a `VmmPool`-backed allocation is a no-op rather
+//! than a recycle, since the pool's own watermark reset is what reclaims
+//! that space.
 
 use std::collections::HashMap;
 use std::marker::PhantomData;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use rocm_rs::hip::bindings;
 use rocm_rs::hip::error::Error as HipError;
+use rocm_rs::hip::Stream;
 
-use super::hip_graph::stream_is_capturing;
+use super::hip_graph::{stream_is_capturing, HipGraph, HipGraphCapture};
 use super::wrappers::SendSyncStream;
 
 fn hip_check(status: bindings::hipError_t) -> Result<(), HipError> {
@@ -111,6 +119,10 @@ unsafe impl Send for Block {}
 struct FreeLists {
     map: HashMap<usize, Vec<Block>>,
     cached_bytes: usize,
+    /// Set by [`GraphCaptureSession::new`]; while `Some`, `alloc_bytes`
+    /// routes through this pool instead of `map`, giving a HIP graph
+    /// capture the address-stable allocations it needs.
+    capture_pool: Option<Arc<VmmPool>>,
 }
 
 /// Caching device allocator for one [`super::RocmDevice`].
@@ -165,27 +177,42 @@ impl RocmAllocator {
         self.free.lock().unwrap_or_else(|e| e.into_inner())
     }
 
-    /// A block of at least `size` bytes, from the free list if one is parked.
-    fn alloc_bytes(&self, size: usize) -> Result<(*mut std::ffi::c_void, usize), HipError> {
+    /// A block of at least `size` bytes, from the free list if one is
+    /// parked, or from the capture-mode `VmmPool` if a
+    /// [`GraphCaptureSession`] is currently alive on this allocator.
+    ///
+    /// A `VmmPool`-backed allocation is reported as [`AllocOrigin::Pool`],
+    /// which [`Self::recycle`] matches to skip parking it on the bucketed
+    /// free list.
+    fn alloc_bytes(&self, size: usize) -> Result<(*mut std::ffi::c_void, AllocOrigin), HipError> {
         if size == 0 {
-            return Ok((std::ptr::null_mut(), 0));
+            return Ok((std::ptr::null_mut(), AllocOrigin::Bucketed(0)));
         }
-        let bucket = bucket_size(size);
-        {
+        let bucket = {
             let mut free = self.lock_free();
+            if let Some(pool) = free.capture_pool.clone() {
+                drop(free);
+                let slice = pool.alloc(size)?;
+                let (ptr, epoch) = (slice.ptr, slice.birth_epoch);
+                return Ok((ptr, AllocOrigin::Pool { pool, epoch }));
+            }
+            let bucket = bucket_size(size);
             if let Some(block) = free.map.get_mut(&bucket).and_then(Vec::pop) {
                 free.cached_bytes -= bucket;
-                return Ok((block.0, bucket));
+                return Ok((block.0, AllocOrigin::Bucketed(bucket)));
             }
-        }
+            bucket
+        };
 
         match raw_malloc(bucket) {
-            Ok(ptr) => Ok((ptr, bucket)),
+            Ok(ptr) => Ok((ptr, AllocOrigin::Bucketed(bucket))),
             // Out of memory only means the *cache* is holding it. Hand
             // everything back and try once more before reporting failure.
             Err(e) => {
                 self.release_all();
-                raw_malloc(bucket).map(|ptr| (ptr, bucket)).map_err(|_| e)
+                raw_malloc(bucket)
+                    .map(|ptr| (ptr, AllocOrigin::Bucketed(bucket)))
+                    .map_err(|_| e)
             }
         }
     }
@@ -201,10 +228,20 @@ impl RocmAllocator {
     /// list, so `alloc_bytes`' release-and-retry cannot save *them* from an
     /// OOM this cache caused. Largest-first eviction throws out exactly the
     /// outgrown blocks while the small, hot buckets survive.
-    fn recycle(&self, ptr: *mut std::ffi::c_void, bucket: usize) {
+    fn recycle(&self, ptr: *mut std::ffi::c_void, origin: &AllocOrigin) {
         if ptr.is_null() {
             return;
         }
+        // `AllocOrigin::Pool` is a `VmmPool`-backed allocation (see
+        // `alloc_bytes`'s doc comment): freeing it is a no-op, since the
+        // pool's own watermark reset is what reclaims that space. Parking it
+        // here instead would let a later bucketed allocation hand it out as
+        // if it were `hipMalloc` memory, and eventually `hipFree` an address
+        // `hipMemAddressReserve` owns.
+        let bucket = match origin {
+            AllocOrigin::Pool { .. } => return,
+            AllocOrigin::Bucketed(bucket) => *bucket,
+        };
         let evicted = {
             let mut free = self.lock_free();
             free.map.entry(bucket).or_default().push(Block(ptr));
@@ -271,6 +308,154 @@ impl RocmAllocator {
             }
         }
     }
+}
+
+/// A single HIP graph capture attempt, tying together the HIP capture
+/// session, the allocator's capture-mode routing, and the `VmmPool`
+/// watermark they share.
+///
+/// Dropping an uncommitted session (i.e. one [`Self::end`] was never called
+/// on) rolls `pool` back to the watermark recorded at [`Self::new`], so a
+/// retried capture attempt gets the same addresses as the one it replaces.
+/// A committed session (after [`Self::end`] succeeds) leaves the pool's
+/// watermark advanced, since the addresses it allocated are baked into the
+/// returned [`HipGraph`] and must stay live for replay.
+///
+/// # Safety contract
+/// No other thread may allocate through `alloc` (e.g. via a cloned
+/// [`super::RocmDevice`] sharing the same allocator) while a session is
+/// alive. Such an allocation would be routed through `pool` like any
+/// capture-time allocation, but is not actually part of the capture; if
+/// the session is later abandoned, rolling `pool` back past that unrelated
+/// allocation's address lets a later allocation alias it. This mirrors the
+/// existing requirement, documented on [`HipGraphCapture`], that no
+/// unrelated activity runs on the captured stream.
+#[must_use = "a capture session does nothing if immediately dropped"]
+pub struct GraphCaptureSession<'a> {
+    capture: Option<HipGraphCapture<'a>>,
+    alloc: &'a RocmAllocator,
+    pool: Arc<VmmPool>,
+    mark: usize,
+    committed: bool,
+}
+
+impl<'a> GraphCaptureSession<'a> {
+    /// Begin a HIP graph capture on `stream`, routing allocations made on
+    /// `alloc` during the capture through `pool` instead of the bucketed
+    /// free list.
+    ///
+    /// # Errors
+    /// Returns an error if `pool` already backs another capture session (on
+    /// this or any other allocator), if a capture is already in progress on
+    /// `alloc` (nested capture is not supported), or if
+    /// `hipStreamBeginCapture` itself fails.
+    pub fn new(
+        alloc: &'a RocmAllocator,
+        stream: &'a Stream,
+        pool: Arc<VmmPool>,
+    ) -> Result<Self, HipError> {
+        // Claims `pool` for this session before anything else runs, so two
+        // sessions on two different allocators can never share one pool:
+        // the `capture_pool` check below is per-allocator and would not
+        // catch that case.
+        if pool
+            .in_use
+            .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
+            .is_err()
+        {
+            return Err(HipError::new(
+                bindings::hipError_t_hipErrorStreamCaptureUnsupported,
+            ));
+        }
+        let mark = pool.watermark();
+        if alloc.lock_free().capture_pool.is_some() {
+            pool.in_use.store(false, Ordering::Release);
+            return Err(HipError::new(
+                bindings::hipError_t_hipErrorStreamCaptureUnsupported,
+            ));
+        }
+        let capture = match HipGraphCapture::begin(stream) {
+            Ok(capture) => capture,
+            Err(e) => {
+                pool.in_use.store(false, Ordering::Release);
+                return Err(e);
+            }
+        };
+        // Only routed through `pool` once the real HIP capture has actually
+        // begun, so `alloc_bytes` never diverts to `pool` for a buffer that
+        // isn't being captured.
+        alloc.lock_free().capture_pool = Some(pool.clone());
+        Ok(Self {
+            capture: Some(capture),
+            alloc,
+            pool,
+            mark,
+            committed: false,
+        })
+    }
+
+    /// End the capture and return the recorded graph, committing the
+    /// `VmmPool` allocations made during it so `Drop` does not roll them
+    /// back.
+    ///
+    /// # Pool lifetime
+    /// The returned graph's instantiated `HipGraphExec`s launch kernels
+    /// that reference addresses this session allocated from `pool`. The
+    /// caller must keep the same `Arc<VmmPool>` passed to
+    /// [`RocmDevice::begin_graph_capture`](super::RocmDevice::begin_graph_capture)
+    /// alive for as long as any such `HipGraphExec` is alive — dropping the
+    /// last `Arc` unmaps those addresses out from under any exec that still
+    /// references them.
+    ///
+    /// # Errors
+    /// Returns an error if the underlying `hipStreamEndCapture` fails.
+    ///
+    /// # Panics
+    /// Never in practice: `self.capture` is only ever cleared by this
+    /// method, which consumes `self`, so no other call can run first.
+    pub fn end(mut self) -> Result<Option<HipGraph>, HipError> {
+        let capture = self.capture.take().expect("capture already ended");
+        let graph = capture.end()?;
+        // Stop routing through `pool` as soon as the real capture has
+        // ended, rather than waiting for `Drop`.
+        self.alloc.lock_free().capture_pool = None;
+        self.committed = true;
+        Ok(graph)
+    }
+}
+
+impl Drop for GraphCaptureSession<'_> {
+    fn drop(&mut self) {
+        // End the real HIP capture (if `end` was never called) before
+        // flipping the allocator's routing flag off, so the window where
+        // `alloc` routes through `pool` is never wider than the window
+        // where the stream is actually capturing.
+        drop(self.capture.take());
+        self.alloc.lock_free().capture_pool = None;
+        if !self.committed {
+            // Abandoned without `.end()` (early return, panic, or simply
+            // dropped). Roll the pool back to the watermark recorded at
+            // `new` so the next attempt reuses the same addresses.
+            self.pool.reset_to(self.mark);
+        }
+        self.pool.in_use.store(false, Ordering::Release);
+    }
+}
+
+/// Where a block handed out by [`RocmAllocator::alloc_bytes`] came from,
+/// and therefore how [`RocmAllocator::recycle`] must treat it when freed.
+#[derive(Clone)]
+enum AllocOrigin {
+    /// Parked on the bucketed free list at this bucket size.
+    Bucketed(usize),
+    /// Bump-allocated from `pool` during a [`GraphCaptureSession`], at
+    /// `epoch`. Freeing it is a no-op, since the pool's own watermark reset
+    /// is what reclaims that space. `epoch` is `pool`'s
+    /// [`VmmPool::reset_to`] generation at allocation time, checked by
+    /// [`SendSyncDeviceMemory::as_ptr`] and [`SendSyncDeviceMemory::ptr_at`]
+    /// against `pool`'s current generation, mirroring [`VmmSlice::as_ptr`]'s
+    /// own check.
+    Pool { pool: Arc<VmmPool>, epoch: u64 },
 }
 
 /// The cap on parked bytes: an eighth of the card's VRAM, overridable with
@@ -377,6 +562,11 @@ pub struct VmmPool {
     /// invalidated its address. Outside the mutex since it is read from
     /// [`VmmSlice::as_ptr`] without taking the lock.
     epoch: AtomicU64,
+    /// Set while a [`GraphCaptureSession`] holds this pool. Lets `new`
+    /// reject a second session on this pool even if it targets a different
+    /// [`RocmAllocator`]/device, which the allocator's own `capture_pool`
+    /// check cannot see.
+    in_use: AtomicBool,
     state: Mutex<VmmPoolState>,
 }
 
@@ -396,6 +586,7 @@ impl VmmPool {
             device_id,
             granularity,
             epoch: AtomicU64::new(0),
+            in_use: AtomicBool::new(false),
             state: Mutex::new(VmmPoolState {
                 base: std::ptr::null_mut(),
                 mapped: 0,
@@ -685,10 +876,10 @@ unsafe impl Sync for VmmSlice<'_> {}
 /// longer drains the device.
 pub struct SendSyncDeviceMemory<T> {
     ptr: *mut std::ffi::c_void,
-    /// Requested size in bytes. The block behind it is [`Self::bucket`] bytes,
-    /// which is at least this.
+    /// Requested size in bytes. The block behind it is at least this size;
+    /// see [`AllocOrigin`] for how much more.
     size: usize,
-    bucket: usize,
+    origin: AllocOrigin,
     alloc: Arc<RocmAllocator>,
     phantom: PhantomData<T>,
 }
@@ -708,19 +899,38 @@ unsafe impl<T> Sync for SendSyncDeviceMemory<T> {}
 impl<T> SendSyncDeviceMemory<T> {
     pub(crate) fn new(alloc: &Arc<RocmAllocator>, count: usize) -> Result<Self, HipError> {
         let size = count * std::mem::size_of::<T>();
-        let (ptr, bucket) = alloc.alloc_bytes(size)?;
+        let (ptr, origin) = alloc.alloc_bytes(size)?;
         Ok(Self {
             ptr,
             size,
-            bucket,
+            origin,
             alloc: alloc.clone(),
             phantom: PhantomData,
         })
     }
 
     /// Base device pointer. Arithmetic on it advances *bytes*.
+    ///
+    /// # Panics
+    /// Panics in debug builds if this allocation came from a `VmmPool` that
+    /// was reset via [`VmmPool::reset_to`] since it was allocated, since the
+    /// returned pointer would then be stale. See [`AllocOrigin::Pool`].
     pub fn as_ptr(&self) -> *mut std::ffi::c_void {
+        self.check_not_stale();
         self.ptr
+    }
+
+    /// Panics in debug builds if this allocation is `VmmPool`-backed and the
+    /// pool has since been reset past it. Shared by [`Self::as_ptr`] and
+    /// [`Self::ptr_at`], the two accessors that hand back the raw pointer.
+    fn check_not_stale(&self) {
+        if let AllocOrigin::Pool { pool, epoch } = &self.origin {
+            debug_assert_eq!(
+                *epoch,
+                pool.epoch.load(Ordering::Relaxed),
+                "SendSyncDeviceMemory used after VmmPool reset"
+            );
+        }
     }
 
     /// Size of the allocation in bytes, as requested rather than as bucketed.
@@ -743,7 +953,13 @@ impl<T> SendSyncDeviceMemory<T> {
     ///
     /// # Safety
     /// `offset` must be within the allocation.
+    ///
+    /// # Panics
+    /// Panics in debug builds if this allocation came from a `VmmPool` that
+    /// was reset via [`VmmPool::reset_to`] since it was allocated. See
+    /// [`Self::as_ptr`].
     pub unsafe fn ptr_at(&self, offset: usize) -> *mut std::ffi::c_void {
+        self.check_not_stale();
         self.ptr.add(offset * std::mem::size_of::<T>())
     }
 
@@ -887,7 +1103,7 @@ impl<T> SendSyncDeviceMemory<T> {
 
 impl<T> Drop for SendSyncDeviceMemory<T> {
     fn drop(&mut self) {
-        self.alloc.recycle(self.ptr, self.bucket);
+        self.alloc.recycle(self.ptr, &self.origin);
         self.ptr = std::ptr::null_mut();
     }
 }

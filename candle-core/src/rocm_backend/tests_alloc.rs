@@ -3,6 +3,9 @@
 //! Split from that module's own unit tests, which cover the pure bucket
 //! arithmetic and need no device.
 
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Barrier};
+
 use rocm_rs::hip::bindings;
 
 use super::{RocmDevice, VmmPool, WrapErr};
@@ -292,6 +295,155 @@ fn vmm_pool_write_readback_round_trips() -> Result<()> {
     assert_eq!(status, bindings::hipError_t_hipSuccess);
 
     assert_eq!(readback, data);
+    Ok(())
+}
+
+/// Allocations made inside a graph capture session must come from the
+/// `VmmPool` (stable addresses across a reset watermark), and allocations
+/// outside the session must keep using the bucketed free list (recycled
+/// addresses), with the session restoring bucketed routing once ended.
+#[test]
+fn capture_mode_routes_allocs_through_vmm_pool() -> Result<()> {
+    let dev = device!();
+    let pool = Arc::new(VmmPool::new(0).w()?);
+
+    // Outside the session: ordinary bucketed reuse.
+    let bucketed_first = dev.alloc::<u8>(4096)?.as_ptr();
+    drop(dev.alloc::<u8>(4096)?);
+
+    // Inside the session: replaying the same allocation sequence against a
+    // reset watermark reproduces the same VMM address. If capture mode had
+    // not actually engaged, this would just hit the bucketed free list and
+    // reproduce `bucketed_first` instead, which the `assert_ne!` below rules
+    // out. Each pass commits via `.end()`, so the watermark has to be reset
+    // by hand between passes to get the same addresses again.
+    let mark = pool.watermark();
+    let session = dev.begin_graph_capture(pool.clone())?;
+    let vmm_first = dev.alloc::<u8>(4096)?.as_ptr();
+    session.end().w()?;
+
+    pool.reset_to(mark);
+    let session = dev.begin_graph_capture(pool.clone())?;
+    let vmm_second = dev.alloc::<u8>(4096)?.as_ptr();
+    session.end().w()?;
+
+    assert_eq!(vmm_first, vmm_second);
+    assert_ne!(vmm_first, bucketed_first);
+
+    // The session restores bucketed routing once ended.
+    assert_eq!(dev.alloc::<u8>(4096)?.as_ptr(), bucketed_first);
+    Ok(())
+}
+
+/// Freeing an allocation made during a capture session must not push it onto
+/// the bucketed free list: its address is owned by the `VmmPool`, and
+/// recycling it into the bucketed allocator's bookkeeping would eventually
+/// `hipFree` an address `hipMemAddressReserve` owns.
+#[test]
+fn capture_mode_allocs_are_not_recycled() -> Result<()> {
+    let dev = device!();
+    let pool = Arc::new(VmmPool::new(0).w()?);
+    let before = dev.allocator.cached_bytes();
+
+    {
+        let _session = dev.begin_graph_capture(pool.clone())?;
+        drop(dev.alloc::<u8>(4096)?);
+    }
+
+    assert_eq!(dev.allocator.cached_bytes(), before);
+    Ok(())
+}
+
+/// A second capture attempt started before the first one ends must be
+/// rejected with an error rather than silently corrupting the first
+/// capture's allocator routing, and must not panic: a multi-request server
+/// retrying a failed capture is exactly the caller this has to survive.
+#[test]
+fn begin_graph_capture_rejects_nested_capture() -> Result<()> {
+    let dev = device!();
+    let pool = Arc::new(VmmPool::new(0).w()?);
+
+    let _outer = dev.begin_graph_capture(pool.clone())?;
+    assert!(dev.begin_graph_capture(pool.clone()).is_err());
+    Ok(())
+}
+
+/// Two threads racing `begin_graph_capture` against the same pool and
+/// device must leave exactly one of them holding the session. The
+/// sequential nested-capture test above cannot exercise this: it never
+/// gives a second attempt a chance to run while the first is still being
+/// set up, which is exactly the window the `VmmPool::in_use` guard and the
+/// allocator's `capture_pool` check both have to close.
+#[test]
+fn begin_graph_capture_rejects_concurrent_capture() -> Result<()> {
+    let dev = device!();
+    let pool = Arc::new(VmmPool::new(0).w()?);
+    let start = Arc::new(Barrier::new(2));
+    let done = Arc::new(Barrier::new(2));
+    let first_ok = Arc::new(AtomicBool::new(false));
+
+    let other_dev = dev.clone();
+    let other_pool = pool.clone();
+    let other_start = start.clone();
+    let other_done = done.clone();
+    let other_first_ok = first_ok.clone();
+    let handle = std::thread::spawn(move || {
+        let session = other_dev.begin_graph_capture(other_pool);
+        other_first_ok.store(session.is_ok(), Ordering::SeqCst);
+        other_start.wait();
+        // Keep the session alive until the main thread's attempt is done.
+        other_done.wait();
+        drop(session);
+    });
+
+    start.wait();
+    let second_ok = dev.begin_graph_capture(pool).is_ok();
+    done.wait();
+    handle.join().unwrap();
+
+    assert_ne!(
+        first_ok.load(Ordering::SeqCst),
+        second_ok,
+        "exactly one concurrent capture attempt must succeed"
+    );
+    Ok(())
+}
+
+/// Dropping a capture session without calling `.end()` must roll the
+/// `VmmPool` watermark back to where it was when the session began, so a
+/// retried capture attempt gets the same addresses as the abandoned one
+/// instead of drifting forward every time a capture is aborted.
+#[test]
+fn graph_capture_session_rolls_back_pool_on_abandoned_capture() -> Result<()> {
+    let dev = device!();
+    let pool = Arc::new(VmmPool::new(0).w()?);
+    let mark = pool.watermark();
+
+    {
+        let _session = dev.begin_graph_capture(pool.clone())?;
+        drop(dev.alloc::<u8>(4096)?);
+        // `_session` is dropped here without `.end()`.
+    }
+
+    assert_eq!(pool.watermark(), mark);
+    Ok(())
+}
+
+/// A capture session that ends successfully must leave the `VmmPool`
+/// watermark advanced rather than rolling it back: the addresses it
+/// allocated are baked into the returned graph and must stay live for
+/// replay.
+#[test]
+fn graph_capture_session_keeps_watermark_after_successful_end() -> Result<()> {
+    let dev = device!();
+    let pool = Arc::new(VmmPool::new(0).w()?);
+    let mark = pool.watermark();
+
+    let session = dev.begin_graph_capture(pool.clone())?;
+    drop(dev.alloc::<u8>(4096)?);
+    session.end().w()?;
+
+    assert!(pool.watermark() > mark);
     Ok(())
 }
 

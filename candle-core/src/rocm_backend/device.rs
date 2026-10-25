@@ -2,7 +2,9 @@ use crate::Result;
 use candle_rocm_kernels::KernelCache;
 use std::sync::{Arc, Mutex, RwLock};
 
-use super::alloc::{PinnedBuffer, RocmAllocator, SendSyncDeviceMemory};
+use super::alloc::{
+    GraphCaptureSession, PinnedBuffer, RocmAllocator, SendSyncDeviceMemory, VmmPool,
+};
 #[cfg(feature = "miopen")]
 use super::wrappers::SendSyncMIOpenHandle;
 use super::wrappers::{RocmBlas, SendSyncPseudoRng, SendSyncRocblasHandle, SendSyncStream};
@@ -278,6 +280,22 @@ impl RocmDevice {
         self.bind()?;
         PinnedBuffer::new(len, self.stream.clone())
             .map_err(|e| rocm_error(format!("Failed to allocate pinned host memory: {}", e)))
+    }
+
+    /// Begin a HIP graph capture, routing allocations made during it
+    /// through `pool` instead of the bucketed free list so they get the
+    /// stable addresses graph replay needs. See [`GraphCaptureSession`] for
+    /// the contract on concurrent allocation from other threads/clones of
+    /// this device while the returned session is alive.
+    ///
+    /// # Errors
+    /// Returns an error if `pool` is already in use by another capture
+    /// session, if a capture is already in progress on this device, or if
+    /// the underlying `hipStreamBeginCapture` fails.
+    pub fn begin_graph_capture(&self, pool: Arc<VmmPool>) -> Result<GraphCaptureSession<'_>> {
+        self.bind()?;
+        GraphCaptureSession::new(&self.allocator, self.stream(), pool)
+            .map_err(|e| rocm_error(format!("Failed to begin HIP graph capture: {}", e)))
     }
 
     pub fn clone_dtoh<T: Default + Clone>(&self, src: &SendSyncDeviceMemory<T>) -> Result<Vec<T>> {
