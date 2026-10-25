@@ -3,7 +3,9 @@
 //! Split from that module's own unit tests, which cover the pure bucket
 //! arithmetic and need no device.
 
-use super::{RocmDevice, WrapErr};
+use rocm_rs::hip::bindings;
+
+use super::{RocmDevice, VmmPool, WrapErr};
 use crate::Result;
 
 /// Returns early when the machine has no ROCm GPU, like the other ROCm test
@@ -174,4 +176,142 @@ fn sync_then_drop_pinned_buffer_is_safe() -> Result<()> {
     let readback = dev.clone_dtoh(&dst)?;
     assert_eq!(readback, data);
     Ok(())
+}
+
+/// Replaying the same allocation sequence against a `VmmPool` reset to an
+/// earlier watermark must return the same addresses every time. This is the
+/// property HIP graph replay depends on: a captured graph bakes in the
+/// addresses recorded during capture.
+#[test]
+fn vmm_pool_allocs_return_stable_addresses() -> Result<()> {
+    let _dev = device!();
+    let pool = VmmPool::new(0).w()?;
+    let sizes = [64usize, 256, 1024, 4096];
+
+    let mark = pool.watermark();
+    let mut first_pass = Vec::new();
+    for &size in &sizes {
+        first_pass.push(pool.alloc(size).w()?.as_ptr());
+    }
+
+    pool.reset_to(mark);
+    let mut second_pass = Vec::new();
+    for &size in &sizes {
+        second_pass.push(pool.alloc(size).w()?.as_ptr());
+    }
+
+    assert_eq!(first_pass, second_pass);
+    Ok(())
+}
+
+/// An allocation larger than what is currently mapped must still succeed,
+/// mapping in more physical pages on demand, and must not alias a live
+/// allocation that came before it.
+#[test]
+fn vmm_pool_grows_past_initial_mapping() -> Result<()> {
+    let _dev = device!();
+    let pool = VmmPool::new(0).w()?;
+
+    // Comfortably larger than any realistic HIP allocation granularity
+    // (typically a few MiB), to force at least one grow, while staying far
+    // below the pool's 32 GiB virtual reservation.
+    let first = pool.alloc(256 << 20).w()?;
+    assert!(!first.as_ptr().is_null());
+    let second = pool.alloc(256 << 20).w()?;
+    assert_ne!(first.as_ptr(), second.as_ptr());
+    Ok(())
+}
+
+/// Resetting to a watermark saved mid-sequence must let a later allocation
+/// reuse exactly the space freed by the reset, without mapping new physical
+/// pages for it.
+#[test]
+fn vmm_pool_reset_reclaims_space() -> Result<()> {
+    let _dev = device!();
+    let pool = VmmPool::new(0).w()?;
+
+    let _first = pool.alloc(1024).w()?;
+    let mark = pool.watermark();
+    let second = pool.alloc(2048).w()?.as_ptr();
+
+    pool.reset_to(mark);
+    let third = pool.alloc(2048).w()?;
+    assert_eq!(second, third.as_ptr());
+    Ok(())
+}
+
+/// Dropping a pool that still has more than one outstanding mapping must not
+/// crash. The `Drop` impl unmaps each tracked mapping individually rather
+/// than in one bulk call, which is the actual ROCm runtime workaround this
+/// guards: a single allocation would pass even with a regression to one bulk
+/// `hipMemUnmap` over the whole mapped range.
+#[test]
+fn vmm_pool_drop_does_not_crash() -> Result<()> {
+    let _dev = device!();
+    let pool = VmmPool::new(0).w()?;
+    // Comfortably larger than any realistic HIP allocation granularity, so
+    // each call forces its own grow and leaves its own entry in `mappings`.
+    let _first = pool.alloc(64 << 20).w()?;
+    let _second = pool.alloc(64 << 20).w()?;
+    Ok(())
+}
+
+/// Data written through a `VmmSlice` must read back unchanged: pointer
+/// equality alone (checked by the other tests) wouldn't catch a
+/// misconfigured `hipMemSetAccess` that still reports success.
+#[test]
+fn vmm_pool_write_readback_round_trips() -> Result<()> {
+    let _dev = device!();
+    let pool = VmmPool::new(0).w()?;
+    let data: Vec<u8> = (0..4096u32).map(|i| (i % 256) as u8).collect();
+
+    let slice = pool.alloc(data.len()).w()?;
+    // SAFETY: `slice` is a device allocation of at least `data.len()` bytes,
+    // mapped read-write by `VmmPool::alloc`; `data` is a valid host slice of
+    // the same length.
+    let status = unsafe {
+        bindings::hipMemcpy(
+            slice.as_ptr(),
+            data.as_ptr() as *const std::ffi::c_void,
+            data.len(),
+            bindings::hipMemcpyKind_hipMemcpyHostToDevice,
+        )
+    };
+    assert_eq!(status, bindings::hipError_t_hipSuccess);
+
+    let mut readback = vec![0u8; data.len()];
+    // SAFETY: same allocation, reversed direction, same length.
+    let status = unsafe {
+        bindings::hipMemcpy(
+            readback.as_mut_ptr() as *mut std::ffi::c_void,
+            slice.as_ptr(),
+            data.len(),
+            bindings::hipMemcpyKind_hipMemcpyDeviceToHost,
+        )
+    };
+    assert_eq!(status, bindings::hipError_t_hipSuccess);
+
+    assert_eq!(readback, data);
+    Ok(())
+}
+
+/// A `VmmSlice` held across the [`VmmPool::reset_to`] that invalidated it is
+/// stale: `as_ptr` must catch that in debug builds rather than silently
+/// handing back an address the pool may have already reused.
+///
+/// `#[should_panic]` tests cannot return `Result`, so the no-GPU skip from
+/// the `device!` macro is replaced with a manual panic carrying the same
+/// message the real assertion would produce.
+#[test]
+#[cfg(debug_assertions)]
+#[should_panic(expected = "VmmSlice used after pool reset")]
+fn vmm_slice_panics_on_stale_use() {
+    if RocmDevice::new(0).is_err() {
+        panic!("VmmSlice used after pool reset");
+    }
+    let pool = VmmPool::new(0).unwrap();
+    let mark = pool.watermark();
+    let slice = pool.alloc(1024).unwrap();
+    pool.reset_to(mark);
+    let _ = slice.as_ptr();
 }

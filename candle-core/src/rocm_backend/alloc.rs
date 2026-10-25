@@ -36,6 +36,16 @@
 //! new owner therefore runs strictly after the work of the old one. Anything
 //! added later that issues on another stream — or on the null stream — must
 //! either take the same stream or synchronise before the buffer can be recycled.
+//!
+//! # Address-stable allocations
+//!
+//! [`VmmPool`] is a separate allocator for a different requirement: HIP
+//! graph replay bakes device addresses into recorded kernel launches, so
+//! anything a captured graph touches must get the same address on every
+//! replay. [`RocmAllocator`]'s free list cannot promise that. `VmmPool`
+//! reserves one virtual address range and bump-allocates within it instead,
+//! so a repeated allocation sequence against a pool reset to the same
+//! watermark always lands at the same addresses.
 
 use std::collections::HashMap;
 use std::marker::PhantomData;
@@ -299,6 +309,374 @@ impl Drop for RocmAllocator {
         self.release_all();
     }
 }
+
+/// Total virtual address space reserved per [`VmmPool`]. Reserving address
+/// space costs nothing until it is actually mapped to physical memory, so
+/// this can be generous: large enough that a capture region's allocation
+/// sequence never runs out across a long decode session.
+const VMM_POOL_RESERVE_BYTES: usize = 1 << 35; // 32 GiB
+
+/// Every [`VmmPool::alloc`] request is rounded up to this boundary, the same
+/// alignment HIP's own allocators use internally.
+const VMM_ALIGNMENT: usize = 128;
+
+fn round_up(n: usize, to: usize) -> usize {
+    n.div_ceil(to) * to
+}
+
+/// Same as [`round_up`], but returns `None` instead of silently wrapping
+/// when `n` is close enough to `usize::MAX` that rounding would overflow.
+/// Used wherever the input isn't already bounded by a known-safe limit.
+fn checked_round_up(n: usize, to: usize) -> Option<usize> {
+    n.div_ceil(to).checked_mul(to)
+}
+
+/// Growth-only virtual memory reservation backing one [`VmmPool`].
+struct VmmPoolState {
+    /// Base of the reserved virtual address range. Null until the first
+    /// [`VmmPool::alloc`] call reserves it.
+    base: *mut std::ffi::c_void,
+    /// Physical bytes mapped into the reservation so far.
+    mapped: usize,
+    /// Bump-allocator offset; the next [`VmmPool::alloc`] starts here.
+    used: usize,
+    /// Every `hipMemMap` call's `(ptr, size)`, unmapped individually on
+    /// `Drop`. A single bulk `hipMemUnmap` over the whole mapped range hits
+    /// a ROCm runtime bug (upstream issue #285) that does not actually
+    /// unmap anything past the first physical allocation.
+    mappings: Vec<(*mut std::ffi::c_void, usize)>,
+}
+
+// SAFETY: the state is virtual and physical device memory addresses, which
+// are process-wide and carry no thread affinity, plus a `Vec` recording
+// them. The `Mutex<VmmPoolState>` in `VmmPool` is the only way to reach this
+// type, so no two threads ever observe it unsynchronized.
+unsafe impl Send for VmmPoolState {}
+
+/// A bump allocator over HIP virtual memory, giving every allocation a
+/// deterministic, stable device address for a given allocation sequence.
+///
+/// Unlike [`RocmAllocator`], which recycles same-size blocks from a free
+/// list with no address guarantee, `VmmPool` reserves one virtual address
+/// range up front and hands out `base + offset` on every call. Replaying
+/// the same sequence of [`Self::alloc`] calls against a pool reset to the
+/// same watermark always returns the same addresses, which is what HIP
+/// graph replay needs: a captured graph's kernel launches bake in the
+/// addresses recorded during capture.
+///
+/// Freeing is watermark-only: a [`VmmSlice`] going out of scope does
+/// nothing, and the bump pointer only moves backward in bulk, via
+/// [`Self::reset_to`]. This is deliberately looser than a strict LIFO free
+/// list, because candle's eager execution does not guarantee tensors drop
+/// in allocation order.
+pub struct VmmPool {
+    device_id: i32,
+    granularity: usize,
+    /// Bumped on every [`Self::reset_to`]. Lets a [`VmmSlice`] detect, in
+    /// debug builds, that it was obtained before a reset that may have
+    /// invalidated its address. Outside the mutex since it is read from
+    /// [`VmmSlice::as_ptr`] without taking the lock.
+    epoch: AtomicU64,
+    state: Mutex<VmmPoolState>,
+}
+
+impl VmmPool {
+    /// Construct a pool for `device_id`.
+    ///
+    /// Only queries the allocation granularity here. The virtual address
+    /// range itself is reserved lazily, on the first [`Self::alloc`] call,
+    /// so constructing a pool that never allocates costs nothing beyond
+    /// this one query.
+    ///
+    /// # Errors
+    /// Returns an error if the underlying granularity query fails.
+    pub fn new(device_id: i32) -> Result<Self, HipError> {
+        let granularity = vmm_granularity(device_id)?;
+        Ok(Self {
+            device_id,
+            granularity,
+            epoch: AtomicU64::new(0),
+            state: Mutex::new(VmmPoolState {
+                base: std::ptr::null_mut(),
+                mapped: 0,
+                used: 0,
+                mappings: Vec::new(),
+            }),
+        })
+    }
+
+    /// Poisoning is ignored, for the same reason as
+    /// [`RocmAllocator::lock_free`]: a panic mid-update can at worst leave
+    /// `mapped`/`used` inconsistent with the mappings `Vec`, and refusing to
+    /// allocate afterwards would be strictly worse than risking that.
+    fn lock(&self) -> MutexGuard<'_, VmmPoolState> {
+        self.state.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Bump-allocate `size` bytes at a stable address.
+    ///
+    /// Reserves the pool's virtual address range on the first call, and
+    /// maps in more physical pages whenever the bump pointer outgrows what
+    /// is already mapped. Replaying the same sequence of `alloc` calls
+    /// against a pool reset to the same watermark always returns the same
+    /// addresses.
+    ///
+    /// # Errors
+    /// Returns an error if the underlying HIP VMM calls fail, or if `size`
+    /// would grow the pool past its reserved address space.
+    pub fn alloc(&self, size: usize) -> Result<VmmSlice<'_>, HipError> {
+        if size == 0 {
+            return Ok(VmmSlice {
+                ptr: std::ptr::null_mut(),
+                pool: self,
+                birth_epoch: self.epoch.load(Ordering::Relaxed),
+            });
+        }
+        let out_of_memory = || HipError::new(bindings::hipError_t_hipErrorOutOfMemory);
+        let size = checked_round_up(size, VMM_ALIGNMENT).ok_or_else(out_of_memory)?;
+        let mut state = self.lock();
+
+        if state.base.is_null() {
+            state.base = reserve_address_range(VMM_POOL_RESERVE_BYTES)?;
+        }
+
+        let offset = state.used;
+        let new_used = offset.checked_add(size).ok_or_else(out_of_memory)?;
+        if new_used > VMM_POOL_RESERVE_BYTES {
+            return Err(out_of_memory());
+        }
+
+        if new_used > state.mapped {
+            let grow = round_up(new_used - state.mapped, self.granularity);
+            // Clamp to what's left in the reservation: `grow` is rounded up
+            // to `self.granularity`, which need not evenly divide
+            // `VMM_POOL_RESERVE_BYTES`, so the rounding alone could overshoot
+            // it. `new_used <= VMM_POOL_RESERVE_BYTES` was just checked
+            // above, so this never clamps below what `new_used` needs.
+            let grow = grow.min(VMM_POOL_RESERVE_BYTES - state.mapped);
+            // SAFETY: `state.base` was reserved for `VMM_POOL_RESERVE_BYTES`
+            // bytes, and `state.mapped + grow <= VMM_POOL_RESERVE_BYTES`
+            // follows from the clamp above.
+            let dst = unsafe { state.base.add(state.mapped) };
+            map_physical_pages(self.device_id, dst, grow)?;
+            state.mappings.push((dst, grow));
+            state.mapped += grow;
+        }
+
+        state.used = new_used;
+        // SAFETY: `offset` is within `[0, state.mapped)`, since `new_used
+        // <= state.mapped` was just ensured above.
+        let ptr = unsafe { state.base.add(offset) };
+        Ok(VmmSlice {
+            ptr,
+            pool: self,
+            birth_epoch: self.epoch.load(Ordering::Relaxed),
+        })
+    }
+
+    /// The current bump-pointer offset, to be restored later via
+    /// [`Self::reset_to`].
+    pub fn watermark(&self) -> usize {
+        self.lock().used
+    }
+
+    /// Roll the bump pointer back to a watermark saved by [`Self::watermark`].
+    ///
+    /// A bulk free for everything allocated since the watermark: the
+    /// physical pages stay mapped, only the next allocation's offset moves
+    /// back. Only valid between capture attempts, never during steady-state
+    /// replay, which never runs the Rust allocation code this method rewinds.
+    ///
+    /// Any [`VmmSlice`] obtained after `mark` but still held past this call
+    /// is stale: its address falls at or past the watermark, so a later
+    /// [`Self::alloc`] can hand out the same address again. The caller must
+    /// not keep such a slice alive across a reset; [`VmmSlice::as_ptr`]
+    /// catches this in debug builds, but release builds hand back the
+    /// address unchecked.
+    ///
+    /// # Panics
+    /// Panics in debug builds if `mark` is past the pool's current bump
+    /// offset, since that would move the pool forward rather than back.
+    pub fn reset_to(&self, mark: usize) {
+        let mut state = self.lock();
+        debug_assert!(mark <= state.used, "reset_to must not grow the pool");
+        state.used = mark.min(state.used);
+        drop(state);
+        self.epoch.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+impl Drop for VmmPool {
+    fn drop(&mut self) {
+        let state = self.lock();
+        for &(ptr, size) in &state.mappings {
+            // SAFETY: each mapping was created by a successful `hipMemMap`
+            // in `alloc` and has not been unmapped yet; no other reference
+            // to `self` exists once `Drop::drop` runs.
+            unsafe {
+                let _ = bindings::hipMemUnmap(ptr, size);
+            }
+        }
+        if !state.base.is_null() {
+            // SAFETY: `state.base` was reserved by a successful
+            // `hipMemAddressReserve` for `VMM_POOL_RESERVE_BYTES` bytes.
+            unsafe {
+                let _ = bindings::hipMemAddressFree(state.base, VMM_POOL_RESERVE_BYTES);
+            }
+        }
+    }
+}
+
+/// An allocation property descriptor for a pinned, device-local VMM mapping
+/// on `device_id`. Every VMM call below (the granularity query, the
+/// physical page creation) needs an identical descriptor.
+fn vmm_alloc_prop(device_id: i32) -> bindings::hipMemAllocationProp {
+    bindings::hipMemAllocationProp {
+        type_: bindings::hipMemAllocationType_hipMemAllocationTypePinned,
+        __bindgen_anon_1: bindings::hipMemAllocationProp__bindgen_ty_1 {
+            requestedHandleType: bindings::hipMemAllocationHandleType_hipMemHandleTypeNone,
+        },
+        location: bindings::hipMemLocation {
+            type_: bindings::hipMemLocationType_hipMemLocationTypeDevice,
+            id: device_id,
+        },
+        win32HandleMetaData: std::ptr::null_mut(),
+        allocFlags: bindings::hipMemAllocationProp__bindgen_ty_2 {
+            compressionType: 0,
+            gpuDirectRDMACapable: 0,
+            usage: 0,
+        },
+    }
+}
+
+fn vmm_granularity(device_id: i32) -> Result<usize, HipError> {
+    let prop = vmm_alloc_prop(device_id);
+    let mut granularity: usize = 0;
+    // SAFETY: `prop` is fully initialized and `granularity` is a valid
+    // out-pointer for a single write.
+    hip_check(unsafe {
+        bindings::hipMemGetAllocationGranularity(
+            &mut granularity,
+            &prop,
+            bindings::hipMemAllocationGranularity_flags_hipMemAllocationGranularityRecommended,
+        )
+    })?;
+    Ok(granularity)
+}
+
+fn reserve_address_range(size: usize) -> Result<*mut std::ffi::c_void, HipError> {
+    let mut ptr = std::ptr::null_mut();
+    // SAFETY: `ptr` is only read once the status has been checked.
+    hip_check(unsafe {
+        bindings::hipMemAddressReserve(&mut ptr, size, 0, std::ptr::null_mut(), 0)
+    })?;
+    Ok(ptr)
+}
+
+/// Map `size` bytes of fresh physical memory at `dst`, which must lie
+/// inside a reserved, not-yet-mapped region of exactly that size.
+///
+/// Leaves nothing behind on failure: a failed `hipMemMap` releases the
+/// handle `hipMemCreate` produced, and a failed `hipMemSetAccess` unmaps
+/// what `hipMemMap` had just mapped before returning.
+fn map_physical_pages(
+    device_id: i32,
+    dst: *mut std::ffi::c_void,
+    size: usize,
+) -> Result<(), HipError> {
+    let prop = vmm_alloc_prop(device_id);
+    let mut handle: bindings::hipMemGenericAllocationHandle_t = std::ptr::null_mut();
+    // SAFETY: `handle` is a valid out-pointer and `prop` is fully
+    // initialized.
+    hip_check(unsafe { bindings::hipMemCreate(&mut handle, size, &prop, 0) })?;
+
+    // SAFETY: `dst` is inside a reserved, unmapped region of exactly `size`
+    // bytes, and `handle` was just created for exactly `size` bytes.
+    if let Err(e) = hip_check(unsafe { bindings::hipMemMap(dst, size, 0, handle, 0) }) {
+        // Nothing was mapped, so only the handle itself needs releasing.
+        // SAFETY: `handle` was created by `hipMemCreate` above and has not
+        // been released yet.
+        unsafe {
+            let _ = bindings::hipMemRelease(handle);
+        }
+        return Err(e);
+    }
+
+    let access = bindings::hipMemAccessDesc {
+        location: bindings::hipMemLocation {
+            type_: bindings::hipMemLocationType_hipMemLocationTypeDevice,
+            id: device_id,
+        },
+        flags: bindings::hipMemAccessFlags_hipMemAccessFlagsProtReadWrite,
+    };
+    // SAFETY: `dst` is valid for `size` bytes, now mapped by the call above.
+    let access_result = hip_check(unsafe { bindings::hipMemSetAccess(dst, size, &access, 1) });
+
+    // The handle is only a temporary reference used to create the mapping;
+    // once mapped, HIP keeps the physical pages alive through the mapping
+    // itself. Release it on every path, success or failure.
+    // SAFETY: `handle` was created above and has not been released yet.
+    unsafe {
+        let _ = bindings::hipMemRelease(handle);
+    }
+
+    if let Err(e) = access_result {
+        // The mapping itself succeeded, so it must be torn down before
+        // returning the error, or the caller would track a mapping that
+        // never actually became accessible.
+        // SAFETY: `dst` was mapped by the successful `hipMemMap` above.
+        unsafe {
+            let _ = bindings::hipMemUnmap(dst, size);
+        }
+        return Err(e);
+    }
+
+    Ok(())
+}
+
+/// A pool-scoped device allocation, returned by [`VmmPool::alloc`].
+///
+/// Borrows [`VmmPool`] so the compiler rejects any use after the pool
+/// backing it is dropped. There is no `Drop` impl: freeing is
+/// watermark-only, so a slice going out of scope does nothing.
+/// [`VmmPool::reset_to`] is what actually reclaims the space.
+///
+/// A slice held past a [`VmmPool::reset_to`] that rewound its offset is
+/// stale: the pool can hand its address out again. The compiler cannot
+/// catch that case, since the pool is still alive. [`Self::as_ptr`] checks
+/// it against the pool's epoch instead, in debug builds.
+pub struct VmmSlice<'pool> {
+    ptr: *mut std::ffi::c_void,
+    pool: &'pool VmmPool,
+    /// The pool's [`VmmPool::reset_to`] generation at the time this slice
+    /// was allocated. Checked against the pool's current generation in
+    /// [`Self::as_ptr`].
+    birth_epoch: u64,
+}
+
+impl VmmSlice<'_> {
+    /// Device pointer to the start of this allocation.
+    ///
+    /// # Panics
+    /// Panics in debug builds if the pool was reset via
+    /// [`VmmPool::reset_to`] since this slice was allocated, since the
+    /// returned pointer would then be stale.
+    pub fn as_ptr(&self) -> *mut std::ffi::c_void {
+        debug_assert_eq!(
+            self.birth_epoch,
+            self.pool.epoch.load(Ordering::Relaxed),
+            "VmmSlice used after pool reset"
+        );
+        self.ptr
+    }
+}
+
+// SAFETY: a device address is process-wide and carries no thread affinity.
+// `VmmSlice` exposes only read-only accessors, so sharing `&VmmSlice` across
+// threads cannot race.
+unsafe impl Send for VmmSlice<'_> {}
+// SAFETY: see the `Send` impl above.
+unsafe impl Sync for VmmSlice<'_> {}
 
 /// A device buffer of `T`, returned to its allocator's free list when dropped.
 ///
