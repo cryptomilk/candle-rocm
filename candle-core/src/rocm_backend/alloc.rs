@@ -39,12 +39,13 @@
 
 use std::collections::HashMap;
 use std::marker::PhantomData;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use rocm_rs::hip::bindings;
 use rocm_rs::hip::error::Error as HipError;
 
+use super::hip_graph::stream_is_capturing;
 use super::wrappers::SendSyncStream;
 
 fn hip_check(status: bindings::hipError_t) -> Result<(), HipError> {
@@ -133,6 +134,18 @@ impl RocmAllocator {
 
     pub(crate) fn raw_stream(&self) -> bindings::hipStream_t {
         self.stream.0.as_raw()
+    }
+
+    /// Rejects a blocking host/device copy issued while this allocator's
+    /// stream is mid-capture, instead of letting it fail deep inside the
+    /// driver with an unrelated-looking error.
+    fn check_not_capturing(&self) -> Result<(), HipError> {
+        if stream_is_capturing(&self.stream.0)? {
+            return Err(HipError::new(
+                bindings::hipError_t_hipErrorStreamCaptureUnsupported,
+            ));
+        }
+        Ok(())
     }
 
     /// Poisoning is ignored: the map is a pure cache, so the worst a panic
@@ -370,6 +383,7 @@ impl<T> SendSyncDeviceMemory<T> {
         if self.ptr.is_null() || data.is_empty() {
             return Ok(());
         }
+        self.alloc.check_not_capturing()?;
         let bytes = self.transfer_bytes(std::mem::size_of_val(data));
         self.synchronize()?;
         // SAFETY: both pointers are valid for `bytes`, which is clamped to the
@@ -435,6 +449,7 @@ impl<T> SendSyncDeviceMemory<T> {
         if self.ptr.is_null() || data.is_empty() {
             return Ok(());
         }
+        self.alloc.check_not_capturing()?;
         let bytes = self.transfer_bytes(std::mem::size_of_val(data));
         self.synchronize()?;
         // SAFETY: as above.

@@ -26,6 +26,7 @@ mod device_backend;
 mod error;
 mod gemm;
 mod gemm_precision;
+mod hip_graph;
 mod launch;
 #[cfg(feature = "miopen")]
 mod miopen;
@@ -60,6 +61,8 @@ mod tests_f8e4m3;
 #[cfg(test)]
 mod tests_gemm;
 #[cfg(test)]
+mod tests_hip_graph;
+#[cfg(test)]
 mod tests_indexing;
 #[cfg(test)]
 mod tests_rng;
@@ -76,6 +79,7 @@ pub use gemm_precision::{
     set_gemm_reduced_precision_bf16, set_gemm_reduced_precision_f16,
     set_gemm_reduced_precision_f32,
 };
+pub use hip_graph::{GraphExecUpdateResult, HipGraph, HipGraphCapture, HipGraphExec};
 pub use launch::{
     kernel_name, launch_config, launch_config_for, launch_config_layout, try_kernel_name,
 };
