@@ -57,7 +57,7 @@
 use std::collections::HashMap;
 use std::marker::PhantomData;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 
 use rocm_rs::hip::bindings;
 use rocm_rs::hip::error::Error as HipError;
@@ -579,8 +579,13 @@ impl VmmPool {
     /// this one query.
     ///
     /// # Errors
-    /// Returns an error if the underlying granularity query fails.
+    /// Returns an error if [`vmm_usable`] reports this runtime cannot back
+    /// a multi-allocation reservation (`ROCm/rocm-systems#2516`), or if the
+    /// underlying granularity query fails.
     pub fn new(device_id: i32) -> Result<Self, HipError> {
+        if !vmm_usable(device_id) {
+            return Err(HipError::new(bindings::hipError_t_hipErrorNotSupported));
+        }
         let granularity = vmm_granularity(device_id)?;
         Ok(Self {
             device_id,
@@ -823,6 +828,74 @@ fn map_physical_pages(
     }
 
     Ok(())
+}
+
+/// Whether this process' HIP runtime can back [`VmmPool`]-style allocations,
+/// i.e. several allocations sharing one `hipMemAddressReserve`d virtual-address
+/// range.
+///
+/// Probes once per process (the result is cached) and never on a device
+/// already known to work, so a caller that checks this before every
+/// [`VmmPool::new`] pays for the real HIP calls only the first time.
+///
+/// # Errors
+/// Returns `false` (conservatively: treat as unusable) if the probe itself
+/// fails for a reason other than the defect it is checking for, e.g. the
+/// granularity query or the initial reservation failing outright.
+#[must_use]
+pub fn vmm_usable(device_id: i32) -> bool {
+    static BROKEN: OnceLock<bool> = OnceLock::new();
+    !*BROKEN.get_or_init(|| probe_set_access_defect(device_id).unwrap_or(true))
+}
+
+/// Whether this HIP runtime fails `hipMemSetAccess` for an allocation that
+/// is not the first in its virtual-address reservation
+/// (`ROCm/rocm-systems#2516`, fixed by `ROCm/rocm-systems#2451`).
+///
+/// Reserves a range sized for a 1-granule and a 2-granule allocation, maps
+/// both into it side by side, and calls `hipMemSetAccess` on each in turn.
+/// The defective runtime validates the requested size against the
+/// reservation's allocations counted from the first one in its own internal
+/// list, rather than from the target allocation, so the second of the two
+/// mapped here always fails that check regardless of which one happens to
+/// be "first" in the runtime's bookkeeping -- one and two granules can never
+/// both legitimately cover each other. A fixed runtime passes both. Frees
+/// everything it allocates, on every path.
+fn probe_set_access_defect(device_id: i32) -> Result<bool, HipError> {
+    let granularity = vmm_granularity(device_id)?;
+    let sizes = [granularity, 2 * granularity];
+    let total: usize = sizes.iter().sum();
+    let base = reserve_address_range(total)?;
+
+    let mut broken = false;
+    let mut mapped_ok = Vec::with_capacity(sizes.len());
+    let mut offset = 0usize;
+    for size in sizes {
+        // SAFETY: `dst` lies within the `total`-byte range `base` just
+        // reserved, at a non-overlapping offset for each `size` in `sizes`.
+        let dst = unsafe { base.add(offset) };
+        match map_physical_pages(device_id, dst, size) {
+            Ok(()) => mapped_ok.push((dst, size)),
+            // `map_physical_pages` already unmapped/released this chunk on
+            // its own failure path; nothing left to clean up for it here.
+            Err(_) => broken = true,
+        }
+        offset += size;
+    }
+
+    for (dst, size) in mapped_ok {
+        // SAFETY: each `(dst, size)` here was mapped successfully above and
+        // not yet unmapped.
+        unsafe {
+            let _ = bindings::hipMemUnmap(dst, size);
+        }
+    }
+    // SAFETY: `base` was reserved for exactly `total` bytes above, and every
+    // mapping within it has just been released.
+    unsafe {
+        let _ = bindings::hipMemAddressFree(base, total);
+    }
+    Ok(broken)
 }
 
 /// A pool-scoped device allocation, returned by [`VmmPool::alloc`].
