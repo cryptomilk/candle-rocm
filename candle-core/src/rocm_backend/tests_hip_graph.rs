@@ -214,3 +214,133 @@ fn concurrent_independent_captures_on_separate_threads() -> Result<()> {
     main_result?;
     Ok(())
 }
+
+/// A host-device copy on one thread while another thread holds an unrelated
+/// stream in capture must succeed, not fail or corrupt the capture.
+/// Regression test for `copy_from_host`/`copy_to_host` issuing a blocking
+/// `hipMemcpy`, which implicitly depends on HIP's legacy/default stream —
+/// illegal while *any* stream in the process is capturing, even one
+/// completely unrelated to the copy.
+#[test]
+fn host_copy_concurrent_with_unrelated_capture() -> Result<()> {
+    use std::sync::{Arc, Barrier};
+    use std::thread;
+
+    const LEN: usize = 1024;
+    const VALUE: i32 = 0x5a;
+
+    // Two barriers pin the main thread's copy strictly inside the capture
+    // window: the capturing thread cannot reach `end()` until the second
+    // wait, so the copy is guaranteed to run while the stream is still
+    // capturing rather than racing to land before or after it.
+    let entered_capture = Arc::new(Barrier::new(2));
+    let copy_done = Arc::new(Barrier::new(2));
+
+    let capturing = {
+        let entered_capture = entered_capture.clone();
+        let copy_done = copy_done.clone();
+        thread::spawn(move || -> Result<()> {
+            let dev = device!();
+            let stream = dev.stream();
+            let buf = dev.alloc::<u8>(LEN)?;
+
+            let capture = HipGraphCapture::begin(stream)?;
+            entered_capture.wait();
+            copy_done.wait();
+            // SAFETY: `buf.as_ptr()` is valid for `LEN` bytes for the
+            // lifetime of `buf`, and `stream` is in capture mode.
+            hip_check(unsafe {
+                bindings::hipMemsetAsync(buf.as_ptr(), VALUE, LEN, stream.as_raw())
+            })?;
+            capture.end()?;
+            Ok(())
+        })
+    };
+
+    let dev = device!();
+    let mut buf = dev.alloc::<u8>(LEN)?;
+    let host_data = vec![VALUE as u8; LEN];
+
+    entered_capture.wait();
+    buf.copy_from_host(&host_data)?;
+    let mut roundtrip = vec![0u8; LEN];
+    buf.copy_to_host(&mut roundtrip)?;
+    copy_done.wait();
+    assert_eq!(roundtrip, host_data);
+
+    capturing.join().expect("thread panicked")?;
+    Ok(())
+}
+
+/// Two threads each capturing a real multi-kernel rocBLAS matmul chain
+/// through the production path (`RocmDevice::begin_graph_capture`'s
+/// `VmmPool`-routed intermediate allocations, warmup passes, then
+/// instantiate/upload/launch — the same shape as `GraphPlan::capture`) at
+/// the same time must not corrupt each other's capture bookkeeping.
+///
+/// [`concurrent_independent_captures_on_separate_threads`] covers the same
+/// claim with a single `hipMemsetAsync` and did not reproduce the original
+/// segfault even at 8 threads x 200 rounds; this mirrors the heavier,
+/// longer-duration, rocBLAS-and-VMM-pool-involving workload that did.
+#[test]
+fn concurrent_graph_plan_style_captures_do_not_corrupt_each_other() -> Result<()> {
+    use super::VmmPool;
+    use crate::{Device, Tensor};
+    use std::sync::{Arc, Barrier};
+    use std::thread;
+
+    const ROUNDS: usize = 20;
+    const THREADS: usize = 8;
+
+    fn matmul_chain(a: &Tensor, w1: &Tensor, w2: &Tensor) -> Result<Tensor> {
+        a.matmul(w1)?.matmul(w2)
+    }
+
+    fn run(barrier: &Barrier) -> Result<()> {
+        let Ok(device) = Device::new_rocm(0) else {
+            return Ok(());
+        };
+        let a = Tensor::randn(0f32, 1.0, (4, 64), &device)?;
+        let w1 = Tensor::randn(0f32, 1.0, (64, 64), &device)?;
+        let w2 = Tensor::randn(0f32, 1.0, (64, 32), &device)?;
+
+        // Warm up kernel JIT/metadata outside capture, matching
+        // `GraphPlan::capture`.
+        for _ in 0..2 {
+            let _ = matmul_chain(&a, &w1, &w2)?;
+        }
+        let rocm_device = device.as_rocm_device()?.clone();
+        rocm_device.synchronize()?;
+
+        for _ in 0..ROUNDS {
+            let pool = Arc::new(VmmPool::new(0)?);
+            barrier.wait();
+            let session = rocm_device.begin_graph_capture(pool)?;
+            let out = matmul_chain(&a, &w1, &w2);
+            let graph = session.end();
+            let out = out?;
+            let graph = graph?.expect("capture recorded matmul kernels");
+            assert!(!graph.is_empty()?);
+            let exec = graph.instantiate()?;
+            exec.upload(rocm_device.stream())?;
+            exec.launch(rocm_device.stream())?;
+            rocm_device.synchronize()?;
+            let _ = out.flatten_all()?.to_vec1::<f32>()?;
+        }
+        Ok(())
+    }
+
+    let barrier = Arc::new(Barrier::new(THREADS));
+    let handles: Vec<_> = (1..THREADS)
+        .map(|_| {
+            let b = barrier.clone();
+            thread::spawn(move || run(&b))
+        })
+        .collect();
+    let main_result = run(&barrier);
+    for handle in handles {
+        handle.join().expect("thread panicked")?;
+    }
+    main_result?;
+    Ok(())
+}

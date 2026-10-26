@@ -1038,14 +1038,20 @@ impl<T> SendSyncDeviceMemory<T> {
 
     /// Host-to-device copy, clamped to the shorter of the two buffers.
     ///
-    /// Drains the stream first, then copies synchronously. The drain is what
-    /// orders this against the queued work of whoever owned the block before —
-    /// the module-level invariant, made explicit rather than left to the
-    /// blocking stream's legacy synchronisation with the null stream. The copy
-    /// itself stays synchronous because `data` is a borrowed host slice the
-    /// caller may drop the moment this returns, and because the driver's
-    /// pageable-memory path is measurably faster than an async copy that is
-    /// immediately waited on.
+    /// Drains the stream first, then copies on it and drains again before
+    /// returning. The first drain orders this against the queued work of
+    /// whoever owned the block before — the module-level invariant, made
+    /// explicit rather than left to a blocking copy's legacy synchronisation
+    /// with the null stream. The copy itself goes through
+    /// `self.alloc.raw_stream()` rather than a plain blocking `hipMemcpy`
+    /// specifically so it carries no implicit dependency on the legacy
+    /// stream: a blocking `hipMemcpy` from any thread while any stream in the
+    /// process is being captured fails with `hipErrorStreamCaptureImplicit`
+    /// (or, worse, corrupts the capture under
+    /// `hipStreamCaptureModeRelaxed`), even though this copy has nothing to
+    /// do with that capture. The caller still observes a fully synchronous
+    /// call, since `data` is a borrowed host slice it may drop the moment
+    /// this returns.
     pub fn copy_from_host(&mut self, data: &[T]) -> Result<(), HipError> {
         if self.ptr.is_null() || data.is_empty() {
             return Ok(());
@@ -1054,15 +1060,18 @@ impl<T> SendSyncDeviceMemory<T> {
         let bytes = self.transfer_bytes(std::mem::size_of_val(data));
         self.synchronize()?;
         // SAFETY: both pointers are valid for `bytes`, which is clamped to the
-        // smaller of the two.
+        // smaller of the two; `data` outlives this call since it is borrowed
+        // for the duration of this function.
         hip_check(unsafe {
-            bindings::hipMemcpy(
+            bindings::hipMemcpyAsync(
                 self.ptr,
                 data.as_ptr() as *const std::ffi::c_void,
                 bytes,
                 bindings::hipMemcpyKind_hipMemcpyHostToDevice,
+                self.alloc.raw_stream(),
             )
-        })
+        })?;
+        self.synchronize()
     }
 
     /// Stream-ordered host-to-device copy from an owned pinned host buffer.
@@ -1110,8 +1119,11 @@ impl<T> SendSyncDeviceMemory<T> {
 
     /// Device-to-host copy, clamped to the shorter of the two buffers.
     ///
-    /// Same shape as [`Self::copy_from_host`]: drain, then copy. The drain is
-    /// also what makes the data this reads the data the caller expects.
+    /// Same shape as [`Self::copy_from_host`]: drain, copy on the device's
+    /// own stream rather than a plain blocking `hipMemcpy`, drain again. The
+    /// first drain is what makes the data this reads the data the caller
+    /// expects; the second is what makes `data` fully written before this
+    /// returns.
     pub fn copy_to_host(&self, data: &mut [T]) -> Result<(), HipError> {
         if self.ptr.is_null() || data.is_empty() {
             return Ok(());
@@ -1121,13 +1133,15 @@ impl<T> SendSyncDeviceMemory<T> {
         self.synchronize()?;
         // SAFETY: as above.
         hip_check(unsafe {
-            bindings::hipMemcpy(
+            bindings::hipMemcpyAsync(
                 data.as_mut_ptr() as *mut std::ffi::c_void,
                 self.ptr,
                 bytes,
                 bindings::hipMemcpyKind_hipMemcpyDeviceToHost,
+                self.alloc.raw_stream(),
             )
-        })
+        })?;
+        self.synchronize()
     }
 
     /// Stream-ordered device-to-device copy, clamped to the shorter buffer.
