@@ -57,13 +57,13 @@
 use std::collections::HashMap;
 use std::marker::PhantomData;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock, RwLock, RwLockReadGuard};
 
 use rocm_rs::hip::bindings;
 use rocm_rs::hip::error::Error as HipError;
 use rocm_rs::hip::Stream;
 
-use super::hip_graph::{stream_is_capturing, HipGraph, HipGraphCapture};
+use super::hip_graph::{HipGraph, HipGraphCapture};
 use super::wrappers::SendSyncStream;
 
 fn hip_check(status: bindings::hipError_t) -> Result<(), HipError> {
@@ -137,6 +137,18 @@ pub struct RocmAllocator {
     /// parked blocks back to the driver, largest first. `usize::MAX` disables
     /// the cap. Atomic only so tests can tighten it through the `Arc`.
     cache_limit: AtomicUsize,
+    /// Fences host/device copies (readers) against the capture-start/end
+    /// transition (writer), so a copy can never observe "not capturing" and
+    /// then have [`GraphCaptureSession::new`] start capturing the same
+    /// stream before the copy's `hipMemcpyAsync` runs. See
+    /// [`RocmAllocator::check_not_capturing`].
+    ///
+    /// Acquisitions ignore poisoning: the `()` payload holds no state to
+    /// corrupt, and a panic mid-critical-section already leaves
+    /// `GraphCaptureSession`'s own `Drop` responsible for reconciling
+    /// `capture_pool` — refusing the lock afterwards would only block that
+    /// cleanup from running.
+    capture_lock: RwLock<()>,
 }
 
 // SAFETY: the state is a stream handle — a process-wide driver object with no
@@ -151,6 +163,7 @@ impl RocmAllocator {
             stream,
             free: Mutex::new(FreeLists::default()),
             cache_limit: AtomicUsize::new(default_cache_limit()),
+            capture_lock: RwLock::new(()),
         }
     }
 
@@ -161,8 +174,17 @@ impl RocmAllocator {
     /// Rejects a blocking host/device copy issued while this allocator's
     /// stream is mid-capture, instead of letting it fail deep inside the
     /// driver with an unrelated-looking error.
-    fn check_not_capturing(&self) -> Result<(), HipError> {
-        if stream_is_capturing(&self.stream.0)? {
+    ///
+    /// Takes the caller's `capture_lock` read guard as proof it is held: this
+    /// checks [`FreeLists::capture_pool`] rather than querying the driver
+    /// directly so that the check is consistent with `capture_lock`'s writer,
+    /// which sets/clears `capture_pool` around the real
+    /// `hipStreamBeginCapture`/`hipStreamEndCapture` calls. Without the
+    /// shared lock, a reader could observe "not capturing" right before a
+    /// writer starts a capture on this same stream, racing the subsequent
+    /// copy against capture start.
+    fn check_not_capturing(&self, _guard: &RwLockReadGuard<'_, ()>) -> Result<(), HipError> {
+        if self.lock_free().capture_pool.is_some() {
             return Err(HipError::new(
                 bindings::hipError_t_hipErrorStreamCaptureUnsupported,
             ));
@@ -368,6 +390,15 @@ impl<'a> GraphCaptureSession<'a> {
             ));
         }
         let mark = pool.watermark();
+        // Held across the `capture_pool` check, `hipStreamBeginCapture`, and
+        // the `capture_pool` flag flip, so a host copy on another thread can
+        // never observe "not capturing" via `check_not_capturing` and then
+        // race its `hipMemcpyAsync` against this capture starting; see
+        // `RocmAllocator::capture_lock`.
+        let write_guard = alloc
+            .capture_lock
+            .write()
+            .unwrap_or_else(|e| e.into_inner());
         if alloc.lock_free().capture_pool.is_some() {
             pool.in_use.store(false, Ordering::Release);
             return Err(HipError::new(
@@ -385,6 +416,7 @@ impl<'a> GraphCaptureSession<'a> {
         // begun, so `alloc_bytes` never diverts to `pool` for a buffer that
         // isn't being captured.
         alloc.lock_free().capture_pool = Some(pool.clone());
+        drop(write_guard);
         Ok(Self {
             capture: Some(capture),
             alloc,
@@ -415,10 +447,17 @@ impl<'a> GraphCaptureSession<'a> {
     /// method, which consumes `self`, so no other call can run first.
     pub fn end(mut self) -> Result<Option<HipGraph>, HipError> {
         let capture = self.capture.take().expect("capture already ended");
+        // See the matching guard in `Self::new`.
+        let write_guard = self
+            .alloc
+            .capture_lock
+            .write()
+            .unwrap_or_else(|e| e.into_inner());
         let graph = capture.end()?;
         // Stop routing through `pool` as soon as the real capture has
         // ended, rather than waiting for `Drop`.
         self.alloc.lock_free().capture_pool = None;
+        drop(write_guard);
         self.committed = true;
         Ok(graph)
     }
@@ -426,12 +465,19 @@ impl<'a> GraphCaptureSession<'a> {
 
 impl Drop for GraphCaptureSession<'_> {
     fn drop(&mut self) {
-        // End the real HIP capture (if `end` was never called) before
-        // flipping the allocator's routing flag off, so the window where
-        // `alloc` routes through `pool` is never wider than the window
-        // where the stream is actually capturing.
+        // See the matching guard in `Self::new`. End the real HIP capture
+        // (if `end` was never called) before flipping the allocator's
+        // routing flag off, so the window where `alloc` routes through
+        // `pool` is never wider than the window where the stream is
+        // actually capturing.
+        let write_guard = self
+            .alloc
+            .capture_lock
+            .write()
+            .unwrap_or_else(|e| e.into_inner());
         drop(self.capture.take());
         self.alloc.lock_free().capture_pool = None;
+        drop(write_guard);
         if !self.committed {
             // Abandoned without `.end()` (early return, panic, or simply
             // dropped). Roll the pool back to the watermark recorded at
@@ -1056,7 +1102,15 @@ impl<T> SendSyncDeviceMemory<T> {
         if self.ptr.is_null() || data.is_empty() {
             return Ok(());
         }
-        self.alloc.check_not_capturing()?;
+        // Held across the whole check-then-copy sequence so a capture
+        // cannot start on this stream between `check_not_capturing` and the
+        // `hipMemcpyAsync` below; see `RocmAllocator::capture_lock`.
+        let _capture_guard = self
+            .alloc
+            .capture_lock
+            .read()
+            .unwrap_or_else(|e| e.into_inner());
+        self.alloc.check_not_capturing(&_capture_guard)?;
         let bytes = self.transfer_bytes(std::mem::size_of_val(data));
         self.synchronize()?;
         // SAFETY: both pointers are valid for `bytes`, which is clamped to the
@@ -1128,7 +1182,13 @@ impl<T> SendSyncDeviceMemory<T> {
         if self.ptr.is_null() || data.is_empty() {
             return Ok(());
         }
-        self.alloc.check_not_capturing()?;
+        // See the matching guard in `Self::copy_from_host`.
+        let _capture_guard = self
+            .alloc
+            .capture_lock
+            .read()
+            .unwrap_or_else(|e| e.into_inner());
+        self.alloc.check_not_capturing(&_capture_guard)?;
         let bytes = self.transfer_bytes(std::mem::size_of_val(data));
         self.synchronize()?;
         // SAFETY: as above.
